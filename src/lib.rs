@@ -1,8 +1,9 @@
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader};
+use tokio::sync::Semaphore;
+use std::sync::{Arc, Mutex};
 use std::error::Error;
 use std::time::Duration;
-use std::sync::{Arc, Mutex};
 
 #[derive(Debug)]
 pub struct Request {
@@ -30,19 +31,35 @@ pub fn parse_request_line(line: &str) -> Result<Request, ParseError> {
     })
 }
 
-async fn handle_connection(mut socket: TcpStream, counter: Arc<Mutex<usize>>) -> Result<(), Box<dyn Error>> {
+async fn read_request_line(socket: &mut TcpStream, timeout_duration: Duration) -> std::io::Result<Option<String>> {
     let mut request_line = String::new();
-    
-    {
-        let mut buf_reader = BufReader::new(&mut socket);
-        let n = buf_reader.read_line(&mut request_line).await?;
-        if n == 0 {
-            return Ok(());
+    let mut buf_reader = BufReader::new(socket);
+
+    let read_result = tokio::time::timeout(timeout_duration, buf_reader.read_line(&mut request_line)).await;
+
+    match read_result {
+        Ok(Ok(0)) => {
+            Ok(None)
         }
+        Ok(Ok(_n)) => {
+            Ok(Some(request_line))
+        }
+        Ok(Err(e)) => {
+            Err(e)
+        }
+        Err(_) => {
+            Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Request time out!"))
+        }
+
     }
+}
 
-    println!("Request: {}", request_line.trim_end());
-
+async fn handle_connection(mut socket: TcpStream, counter: Arc<Mutex<usize>>, timeout_duration: Duration) -> Result<(), Box<dyn Error>> {
+    let request_line = match read_request_line(&mut socket, timeout_duration).await? {
+        Some(line) => line,
+        None => return Ok(())
+    };
+    
     let request = match parse_request_line(&request_line) {
         Ok(req) => req,
         Err(e) => {
@@ -77,16 +94,43 @@ async fn handle_connection(mut socket: TcpStream, counter: Arc<Mutex<usize>>) ->
     Ok(())
 }
 
-pub async fn run(listener: TcpListener, counter: Arc<Mutex<usize>>) -> Result<(), Box<dyn Error>> {
+pub async fn run(listener: TcpListener, counter: Arc<Mutex<usize>>, max_connections: usize, timeout_duration: Duration) -> Result<(), Box<dyn Error>> {
+    let semaphore = Arc::new(Semaphore::new(max_connections));
+    
     loop {
-        let (socket, addr) = listener.accept().await?;
+        let (mut socket, addr) = listener.accept().await?;
         let counter = Arc::clone(&counter);
-        
-        tokio::spawn(async move {
-            if let Err(e) = handle_connection(socket, counter).await {
-                eprintln!("Error pada klien {}: {}", addr, e);
+        let semaphore = Arc::clone(&semaphore);
+
+        match semaphore.try_acquire_owned() {
+            Ok(permit) => {
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    if let Err(e) = handle_connection(socket, counter, timeout_duration).await {
+                        eprintln!("Error pada klien {}: {}", addr, e);
+                    }
+                });
             }
-        });
+            Err(_) => {
+                tokio::spawn(async move {
+                    match read_request_line(&mut socket, timeout_duration).await {
+                        Ok(Some(_)) => {
+                            let body = "Server Busy: Overload";
+                            let response = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
+                            if let Err(e) = socket.write_all(response.as_bytes()).await {
+                                eprintln!("Gagal mengirim 503 ke klien {}: {}", addr, e);
+                            }
+                        }
+                        Ok(None) => {
+                            // return mungkin jangan kembalikan apa-apa
+                        }
+                        Err(e) => {
+                            eprintln!("Gagal membaca karena kesalahan I/O: {e}");
+                        }
+                    }
+                });
+            }
+        }
     }
 }
 
