@@ -1,19 +1,31 @@
 use tokio::net::{TcpListener, TcpStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
-async fn spawn_test_server() -> u16 {
+const DEFAULT_MAX_CONNECTIONS: usize = 100;
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+
+async fn spawn_test_server_with_config(max_connections: usize, timeout_duration: Duration) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let counter = Arc::new(Mutex::new(0));
 
     tokio::spawn(async move {
-        if let Err(e) = tokio_http_server::run(listener, counter).await {
+        if let Err(e) = tokio_http_server::run(listener, counter, max_connections, timeout_duration).await {
             eprintln!("Internal server error\n{e}");
         }
     });
 
     port
+}
+
+async fn spawn_test_server_with_limit(max_connections: usize) -> u16 {
+    spawn_test_server_with_config(max_connections, DEFAULT_TIMEOUT).await
+}
+
+async fn spawn_test_server() -> u16 {
+    spawn_test_server_with_config(DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT).await
 }
 
 #[tokio::test]
@@ -95,6 +107,42 @@ async fn server_closes_connection_when_no_data_sent() {
     let mut stream = TcpStream::connect(server_addr).await.unwrap();
 
     stream.shutdown().await.unwrap();
+
+    let mut buffer = [0u8; 1024];
+    let n = stream.read(&mut buffer).await.unwrap();
+
+    assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn returns_503_when_connection_limit_reached() {
+    let port = spawn_test_server_with_limit(1).await;
+    let server_addr = format!("127.0.0.1:{port}");
+
+    let mut stream1 = TcpStream::connect(&server_addr).await.unwrap();
+    stream1.write_all(b"GET /slow HTTP/1.1\r\n\r\n").await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let mut stream2 = TcpStream::connect(&server_addr).await.unwrap();
+    stream2.write_all(b"GET / HTTP/1.1\r\n\r\n").await.unwrap();
+
+    let mut buffer = [0u8; 1024];
+    let n = stream2.read(&mut buffer).await.unwrap();
+    let response = String::from_utf8_lossy(&buffer[..n]);
+
+    eprintln!("DEBUG response: {response}");
+    assert!(response.contains("503 Service Unavailable"));
+}
+
+#[tokio::test]
+async fn closes_connection_when_read_times_out() {
+    let port = spawn_test_server_with_config(DEFAULT_MAX_CONNECTIONS, Duration::from_millis(200)).await;
+
+    let server_addr = format!("127.0.0.1:{port}");
+    let mut stream = TcpStream::connect(server_addr).await.unwrap();
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
 
     let mut buffer = [0u8; 1024];
     let n = stream.read(&mut buffer).await.unwrap();
