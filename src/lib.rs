@@ -6,15 +6,22 @@ use std::error::Error;
 use std::time::Duration;
 
 #[derive(Debug)]
+pub enum ParseError {
+    InvalidRequest(String)
+}
+
+#[derive(Debug)]
 pub struct Request {
     pub method: String,
     pub path: String,
     pub version: String
 }
 
-#[derive(Debug)]
-pub enum ParseError {
-    InvalidRequest(String)
+#[derive(Debug, Clone, Copy)]
+pub struct ServerConfig {
+    pub max_connections: usize,
+    pub timeout_duration: Duration,
+    pub max_line_size: usize,
 }
 
 pub fn parse_request_line(line: &str) -> Result<Request, ParseError> {
@@ -31,12 +38,12 @@ pub fn parse_request_line(line: &str) -> Result<Request, ParseError> {
     })
 }
 
-async fn read_request_line(socket: &mut TcpStream, timeout_duration: Duration, max_line_size: usize) -> std::io::Result<Option<String>> {
+async fn read_request_line(socket: &mut TcpStream, config: ServerConfig) -> std::io::Result<Option<String>> {
     let mut request_line = String::new();
-    let mut buf_reader = BufReader::new(socket);
-    let mut limited_reader = buf_reader.take(max_line_size as u64);
+    let buf_reader = BufReader::new(socket);
+    let mut limited_reader = buf_reader.take(config.max_line_size as u64);
 
-    let read_result = tokio::time::timeout(timeout_duration, limited_reader.read_line(&mut request_line)).await;
+    let read_result = tokio::time::timeout(config.timeout_duration, limited_reader.read_line(&mut request_line)).await;
 
     match read_result {
         Ok(Ok(0)) => {
@@ -46,7 +53,7 @@ async fn read_request_line(socket: &mut TcpStream, timeout_duration: Duration, m
             if request_line.ends_with("\n") {
                 Ok(Some(request_line))
             } else {
-                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Error: Request length exceeds the 64 bytes limit."))
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Error: Request length exceeds the {} bytes limit.", config.max_line_size)))
             }
         }
         Ok(Err(e)) => {
@@ -59,8 +66,8 @@ async fn read_request_line(socket: &mut TcpStream, timeout_duration: Duration, m
     }
 }
 
-async fn handle_connection(mut socket: TcpStream, counter: Arc<Mutex<usize>>, timeout_duration: Duration) -> Result<(), Box<dyn Error>> {
-    let request_line = match read_request_line(&mut socket, timeout_duration).await? {
+async fn handle_connection(mut socket: TcpStream, counter: Arc<Mutex<usize>>, config: ServerConfig) -> Result<(), Box<dyn Error>> {
+    let request_line = match read_request_line(&mut socket, config).await? {
         Some(line) => line,
         None => return Ok(())
     };
@@ -99,8 +106,8 @@ async fn handle_connection(mut socket: TcpStream, counter: Arc<Mutex<usize>>, ti
     Ok(())
 }
 
-pub async fn run(listener: TcpListener, counter: Arc<Mutex<usize>>, max_connections: usize, timeout_duration: Duration) -> Result<(), Box<dyn Error>> {
-    let semaphore = Arc::new(Semaphore::new(max_connections));
+pub async fn run(listener: TcpListener, counter: Arc<Mutex<usize>>, config: ServerConfig) -> Result<(), Box<dyn Error>> {
+    let semaphore = Arc::new(Semaphore::new(config.max_connections));
     
     loop {
         let (mut socket, addr) = listener.accept().await?;
@@ -111,14 +118,14 @@ pub async fn run(listener: TcpListener, counter: Arc<Mutex<usize>>, max_connecti
             Ok(permit) => {
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(e) = handle_connection(socket, counter, timeout_duration).await {
+                    if let Err(e) = handle_connection(socket, counter, config).await {
                         eprintln!("Error pada klien {}: {}", addr, e);
                     }
                 });
             }
             Err(_) => {
                 tokio::spawn(async move {
-                    match read_request_line(&mut socket, timeout_duration).await {
+                    match read_request_line(&mut socket, config).await {
                         Ok(Some(_)) => {
                             let body = "Server Busy: Overload";
                             let response = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Length: {}\r\n\r\n{}", body.len(), body);
@@ -126,9 +133,7 @@ pub async fn run(listener: TcpListener, counter: Arc<Mutex<usize>>, max_connecti
                                 eprintln!("Gagal mengirim 503 ke klien {}: {}", addr, e);
                             }
                         }
-                        Ok(None) => {
-                            // return mungkin jangan kembalikan apa-apa
-                        }
+                        Ok(None) => {}
                         Err(e) => {
                             eprintln!("Gagal membaca karena kesalahan I/O: {e}");
                         }
