@@ -1,5 +1,5 @@
 use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncWriteExt, AsyncBufReadExt, BufReader};
+use tokio::io::{AsyncWriteExt, AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::sync::Semaphore;
 use std::sync::{Arc, Mutex};
 use std::error::Error;
@@ -31,18 +31,23 @@ pub fn parse_request_line(line: &str) -> Result<Request, ParseError> {
     })
 }
 
-async fn read_request_line(socket: &mut TcpStream, timeout_duration: Duration) -> std::io::Result<Option<String>> {
+async fn read_request_line(socket: &mut TcpStream, timeout_duration: Duration, max_line_size: usize) -> std::io::Result<Option<String>> {
     let mut request_line = String::new();
     let mut buf_reader = BufReader::new(socket);
+    let mut limited_reader = buf_reader.take(max_line_size as u64);
 
-    let read_result = tokio::time::timeout(timeout_duration, buf_reader.read_line(&mut request_line)).await;
+    let read_result = tokio::time::timeout(timeout_duration, limited_reader.read_line(&mut request_line)).await;
 
     match read_result {
         Ok(Ok(0)) => {
             Ok(None)
         }
         Ok(Ok(_n)) => {
-            Ok(Some(request_line))
+            if request_line.ends_with("\n") {
+                Ok(Some(request_line))
+            } else {
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "Error: Request length exceeds the 64 bytes limit."))
+            }
         }
         Ok(Err(e)) => {
             Err(e)
