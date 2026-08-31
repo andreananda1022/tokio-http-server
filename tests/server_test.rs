@@ -1,18 +1,20 @@
-use tokio::net::{TcpListener, TcpStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_http_server::ServerConfig;
 
 const DEFAULT_MAX_CONNECTIONS: usize = 100;
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(10);
+const DEFAULT_MAX_LINE_SIZE: usize = 8192;
 
-async fn spawn_test_server_with_config(max_connections: usize, timeout_duration: Duration) -> u16 {
+async fn spawn_test_server_with_config(config: ServerConfig) -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let counter = Arc::new(Mutex::new(0));
 
     tokio::spawn(async move {
-        if let Err(e) = tokio_http_server::run(listener, counter, max_connections, timeout_duration).await {
+        if let Err(e) = tokio_http_server::run(listener, counter, config).await {
             eprintln!("Internal server error\n{e}");
         }
     });
@@ -21,11 +23,19 @@ async fn spawn_test_server_with_config(max_connections: usize, timeout_duration:
 }
 
 async fn spawn_test_server_with_limit(max_connections: usize) -> u16 {
-    spawn_test_server_with_config(max_connections, DEFAULT_TIMEOUT).await
+    spawn_test_server_with_config(ServerConfig {
+        max_connections,
+        timeout_duration: DEFAULT_TIMEOUT,
+        max_line_size: DEFAULT_MAX_LINE_SIZE,
+    }).await
 }
 
 async fn spawn_test_server() -> u16 {
-    spawn_test_server_with_config(DEFAULT_MAX_CONNECTIONS, DEFAULT_TIMEOUT).await
+    spawn_test_server_with_config(ServerConfig {
+        max_connections: DEFAULT_MAX_CONNECTIONS,
+        timeout_duration: DEFAULT_TIMEOUT,
+        max_line_size: DEFAULT_MAX_LINE_SIZE,
+    }).await
 }
 
 #[tokio::test]
@@ -120,7 +130,10 @@ async fn returns_503_when_connection_limit_reached() {
     let server_addr = format!("127.0.0.1:{port}");
 
     let mut stream1 = TcpStream::connect(&server_addr).await.unwrap();
-    stream1.write_all(b"GET /slow HTTP/1.1\r\n\r\n").await.unwrap();
+    stream1
+        .write_all(b"GET /slow HTTP/1.1\r\n\r\n")
+        .await
+        .unwrap();
 
     tokio::time::sleep(Duration::from_millis(50)).await;
 
@@ -137,7 +150,11 @@ async fn returns_503_when_connection_limit_reached() {
 
 #[tokio::test]
 async fn closes_connection_when_read_times_out() {
-    let port = spawn_test_server_with_config(DEFAULT_MAX_CONNECTIONS, Duration::from_millis(200)).await;
+    let port = spawn_test_server_with_config(ServerConfig {
+        max_connections: DEFAULT_MAX_CONNECTIONS,
+        timeout_duration: Duration::from_millis(200),
+        max_line_size: DEFAULT_MAX_LINE_SIZE,
+    }).await;
 
     let server_addr = format!("127.0.0.1:{port}");
     let mut stream = TcpStream::connect(server_addr).await.unwrap();
@@ -148,4 +165,25 @@ async fn closes_connection_when_read_times_out() {
     let n = stream.read(&mut buffer).await.unwrap();
 
     assert_eq!(n, 0);
+}
+
+#[tokio::test]
+async fn returns_413_when_request_line_too_long() {
+    let port = spawn_test_server_with_config(ServerConfig {
+        max_connections: DEFAULT_MAX_CONNECTIONS,
+        timeout_duration: DEFAULT_TIMEOUT,
+        max_line_size: 64,
+    }).await;
+
+    let server_addr = format!("127.0.0.1:{port}");
+    let mut stream = TcpStream::connect(server_addr).await.unwrap();
+
+    let request_line = "GET /api/v1/users/testing/authorization/profile/details/payload/buffer/overflow HTTP/1.1";
+    stream.write_all(request_line.as_bytes()).await.unwrap();
+
+    let mut buffer = [0u8; 1024];
+    let n = stream.read(&mut buffer).await.unwrap();
+    let response = String::from_utf8_lossy(&buffer[..n]);
+
+    assert!(response.contains("413 Payload Too Large"));
 }
