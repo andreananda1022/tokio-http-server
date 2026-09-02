@@ -78,8 +78,10 @@ async fn read_request_line(
     }
 }
 
+#[tracing::instrument(skip(socket, counter, config, addr), fields(client_addr = %addr))]
 async fn handle_connection(
     mut socket: TcpStream,
+    addr: std::net::SocketAddr,
     counter: Arc<Mutex<usize>>,
     config: ServerConfig,
 ) -> Result<(), Box<dyn Error>> {
@@ -165,7 +167,7 @@ pub async fn run(
             Ok(permit) => {
                 tokio::spawn(async move {
                     let _permit = permit;
-                    if let Err(e) = handle_connection(socket, counter, config).await {
+                    if let Err(e) = handle_connection(socket, addr, counter, config).await {
                         warn!(error = %e, client_addr = %addr, "Error pada klien");
                     }
                 });
